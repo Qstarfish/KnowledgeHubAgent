@@ -29,3 +29,8 @@ app:
     user: ${NEO4J_USER:neo4j}
     password: ${NEO4J_PASSWORD:password}
   upload-dir: ./uploads
+  chat-memory:
+    base-dir: ./chat-memory
+    recent-message-count: 6
+    summarize-after-message-count: 12
+    archive-compactions: true

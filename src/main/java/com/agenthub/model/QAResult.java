@@ -13,6 +13,8 @@ import java.util.Map;
 @NoArgsConstructor
 @AllArgsConstructor
 public class QAResult {
+    private String userId;
+    private String sessionId;
     private String question;
     private String answer;
     private double confidence;

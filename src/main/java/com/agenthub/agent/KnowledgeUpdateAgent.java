@@ -38,6 +38,7 @@ public class KnowledgeUpdateAgent {
         this.knowledgeGraph = knowledgeGraph;
     }
 
+    //todo 当前kafka处理消息的 消息幂等性、文件系统噪声
     /**
      * 收到消息后
      * 把消息 JSON 解析出来

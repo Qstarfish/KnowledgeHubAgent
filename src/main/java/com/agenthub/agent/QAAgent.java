@@ -1,6 +1,9 @@
 package com.agenthub.agent;
 
+import com.agenthub.model.AskRequest;
+import com.agenthub.model.ChatMessageRecord;
 import com.agenthub.model.QAResult;
+import com.agenthub.service.ChatMemoryService;
 import com.agenthub.service.KnowledgeGraphService;
 import com.agenthub.service.VectorStoreService;
 import org.springframework.ai.chat.client.ChatClient;
@@ -11,58 +14,74 @@ import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 
 /**
  * 问答 Agent (Java版)
- *
- * 实现 GraphRAG 混合检索:
- *   1. 向量语义检索 (VectorStore)
- *   2. 知识图谱检索 (Neo4j Cypher)
- *   3. 混合重排序
- *   4. LLM 答案生成
  */
 @Component
 public class QAAgent {
 
     private static final String ANSWER_PROMPT = """
-            你是一个专业的企业知识问答助手。根据检索到的上下文信息回答用户问题。
-            要求：答案必须基于上下文，引用来源，如果信息不足请告知用户。
+            你是一个专业的企业知识问答助手。请结合会话记忆和检索到的上下文回答用户问题。
+            要求：
+            1. 优先基于检索上下文回答
+            2. 会话摘要和最近对话只用于承接上下文，不得编造事实
+            3. 如果信息不足，请明确说明
             """;
 
     private final ChatClient chatClient;
+    private final ChatMemoryService chatMemoryService;
     private final VectorStoreService vectorStoreService;
     private final KnowledgeGraphService knowledgeGraphService;
 
     public QAAgent(ChatClient.Builder chatClientBuilder,
+                   ChatMemoryService chatMemoryService,
                    VectorStoreService vectorStoreService,
                    KnowledgeGraphService knowledgeGraphService) {
         this.chatClient = chatClientBuilder.build();
+        this.chatMemoryService = chatMemoryService;
         this.vectorStoreService = vectorStoreService;
         this.knowledgeGraphService = knowledgeGraphService;
     }
 
-    public QAResult answer(String question) {
+    public QAResult answer(AskRequest request) {
+        if (request == null || request.getQuestion() == null || request.getQuestion().isBlank()) {
+            throw new IllegalArgumentException("question must not be blank");
+        }
+
+        var session = chatMemoryService.getOrCreateSession(
+                request.getUserId(),
+                request.getSessionId(),
+                request.isAutoCreateSession(),
+                request.getQuestion()
+        );
+        String userId = session.getUserId();
+        String sessionId = session.getSessionId();
+        String question = request.getQuestion();
+
+        chatMemoryService.appendUserMessage(userId, sessionId, question);
+        ChatMemoryService.MemorySnapshot memorySnapshot = chatMemoryService.loadMemorySnapshot(userId, sessionId);
+
         List<String> reasoning = new ArrayList<>();
 
-        // Step 1: 向量检索
         List<QAResult.RetrievedContext> vectorResults = vectorStoreService.search(question, 5);
-        reasoning.add("向量检索: " + vectorResults.size() + " 条结果");
+        reasoning.add("向量检索命中 " + vectorResults.size() + " 条结果");
 
-        // Step 2: 图谱检索
         List<QAResult.RetrievedContext> graphResults = knowledgeGraphService.searchByQuestion(question);
-        reasoning.add("图谱检索: " + graphResults.size() + " 条结果");
+        reasoning.add("图谱检索命中 " + graphResults.size() + " 条结果");
 
-        // Step 3: 合并重排序
         List<QAResult.RetrievedContext> merged = hybridRerank(vectorResults, graphResults);
         List<QAResult.RetrievedContext> topContexts = merged.subList(0, Math.min(8, merged.size()));
 
-        // Step 4: 生成答案
         String contextText = buildContextText(topContexts);
-        String answerText = generateAnswer(question, contextText);
+        String answerText = generateAnswer(question, contextText, memorySnapshot);
+        chatMemoryService.appendAssistantMessage(userId, sessionId, answerText);
+        chatMemoryService.maybeSummarize(userId, sessionId);
         reasoning.add("答案生成完成");
 
         return QAResult.builder()
+                .userId(userId)
+                .sessionId(sessionId)
                 .question(question)
                 .answer(answerText)
                 .confidence(calcConfidence(topContexts))
@@ -72,45 +91,81 @@ public class QAAgent {
                 .build();
     }
 
-    /**
-     * 混合 向量 和 知识图谱 ，权重重排
-     * todo 没有重新评估 query 和候选的相关性，只是把已有分数按来源加权后合并排序
-     * 用更强模型再次打分
-     * 做 cross-encoder 判断
-     * 基于上下文覆盖率、去重、多样性重新排序
-     * @param vector
-     * @param graph
-     * @return
-     */
     private List<QAResult.RetrievedContext> hybridRerank(
             List<QAResult.RetrievedContext> vector,
             List<QAResult.RetrievedContext> graph) {
         List<QAResult.RetrievedContext> all = new ArrayList<>();
-        vector.forEach(c -> { c.setScore(c.getScore() * 1.0); all.add(c); });
-        graph.forEach(c -> { c.setScore(c.getScore() * 1.2); all.add(c); });
-        all.sort((a, b) -> Double.compare(b.getScore(), a.getScore()));
+        vector.forEach(context -> {
+            context.setScore(context.getScore() * 1.0);
+            all.add(context);
+        });
+        graph.forEach(context -> {
+            context.setScore(context.getScore() * 1.2);
+            all.add(context);
+        });
+        all.sort((left, right) -> Double.compare(right.getScore(), left.getScore()));
         return all;
     }
 
     private String buildContextText(List<QAResult.RetrievedContext> contexts) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < contexts.size(); i++) {
-            QAResult.RetrievedContext c = contexts.get(i);
-            sb.append(String.format("[来源 %d: %s | 分数: %.2f]\n%s\n\n",
-                    i + 1, c.getSource(), c.getScore(), c.getContent()));
+        StringBuilder builder = new StringBuilder();
+        for (int index = 0; index < contexts.size(); index++) {
+            QAResult.RetrievedContext context = contexts.get(index);
+            builder.append(String.format("[来源 %d: %s | 分数: %.2f]%n%s%n%n",
+                    index + 1,
+                    context.getSource(),
+                    context.getScore(),
+                    context.getContent()));
         }
-        return sb.toString();
+        return builder.toString();
     }
 
-    private String generateAnswer(String question, String contextText) {
+    private String generateAnswer(String question,
+                                  String contextText,
+                                  ChatMemoryService.MemorySnapshot memorySnapshot) {
         return chatClient.prompt(new Prompt(List.of(
                 new SystemMessage(ANSWER_PROMPT),
-                new UserMessage("上下文:\n" + contextText + "\n\n问题: " + question)
+                new UserMessage(buildUserPrompt(question, contextText, memorySnapshot))
         ))).call().content();
     }
 
+    private String buildUserPrompt(String question,
+                                   String contextText,
+                                   ChatMemoryService.MemorySnapshot memorySnapshot) {
+        StringBuilder prompt = new StringBuilder();
+        if (memorySnapshot.summary() != null
+                && memorySnapshot.summary().getSummary() != null
+                && !memorySnapshot.summary().getSummary().isBlank()) {
+            prompt.append("会话摘要:\n")
+                    .append(memorySnapshot.summary().getSummary())
+                    .append("\n\n");
+        }
+
+        if (memorySnapshot.recentMessages() != null && !memorySnapshot.recentMessages().isEmpty()) {
+            prompt.append("最近对话:\n")
+                    .append(buildRecentHistory(memorySnapshot.recentMessages()))
+                    .append("\n\n");
+        }
+
+        prompt.append("检索上下文:\n")
+                .append(contextText)
+                .append("\n当前问题: ")
+                .append(question);
+        return prompt.toString();
+    }
+
+    private String buildRecentHistory(List<ChatMessageRecord> recentMessages) {
+        StringBuilder history = new StringBuilder();
+        for (ChatMessageRecord message : recentMessages) {
+            history.append(message.getRole()).append(": ").append(message.getContent()).append("\n");
+        }
+        return history.toString();
+    }
+
     private double calcConfidence(List<QAResult.RetrievedContext> contexts) {
-        if (contexts.isEmpty()) return 0.0;
+        if (contexts.isEmpty()) {
+            return 0.0;
+        }
         return Math.min(contexts.stream().mapToDouble(QAResult.RetrievedContext::getScore).average().orElse(0), 1.0);
     }
 }
