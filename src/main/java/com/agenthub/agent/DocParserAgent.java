@@ -97,7 +97,11 @@ public class DocParserAgent {
                         .build());
                 idx++;
             }
-            start = end - CHUNK_OVERLAP;
+            if (end >= text.length()) {
+                //避免text.length()<CHUNK_SIZE时的死循环 以及 最后一块重复处理的情况
+                break;
+            }
+            start = Math.max(end - CHUNK_OVERLAP, 0);
         }
         return chunks;
     }

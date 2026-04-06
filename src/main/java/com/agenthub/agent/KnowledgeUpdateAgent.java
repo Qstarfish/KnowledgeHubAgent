@@ -72,10 +72,10 @@ public class KnowledgeUpdateAgent {
         List<ExtractionResult> extractions = extractor.extract(chunks);
         for (ExtractionResult ext : extractions) {
             for (ExtractionResult.Entity entity : ext.getEntities()) {
-                knowledgeGraph.upsertEntity(entity);
+                knowledgeGraph.upsertEntity(entity, filePath);
             }
             for (ExtractionResult.Relation relation : ext.getRelations()) {
-                knowledgeGraph.addRelation(relation);
+                knowledgeGraph.addRelation(relation, filePath);
             }
         }
     }
@@ -83,6 +83,7 @@ public class KnowledgeUpdateAgent {
     public void handleModify(String filePath) throws Exception {
         String docId = computeDocId(filePath);
         vectorStore.deleteByDocId(docId);
+        knowledgeGraph.deleteBySource(filePath);
         handleCreate(filePath);
     }
 

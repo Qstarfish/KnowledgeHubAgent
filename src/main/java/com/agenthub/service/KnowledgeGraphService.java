@@ -9,6 +9,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 
@@ -72,38 +73,58 @@ public class KnowledgeGraphService {
      *
      * @param entity
      */
-    public void upsertEntity(ExtractionResult.Entity entity) {
+    public void upsertEntity(ExtractionResult.Entity entity, String source) {
         if (driver == null) return;
+        String docId = computeDocId(source);
         String cypher = """
                 MERGE (e:Entity {name: $name})
-                ON CREATE SET e.type = $type, e.description = $desc, e.created_at = timestamp()
+                ON CREATE SET e.type = $type, e.description = $desc, e.created_at = timestamp(),
+                              e.sources = [$source], e.docIds = [$docId]
                 ON MATCH SET e.description = CASE WHEN $desc <> '' THEN $desc ELSE e.description END,
+                             e.sources = CASE WHEN $source IN coalesce(e.sources, []) THEN e.sources
+                                              ELSE coalesce(e.sources, []) + $source END,
+                             e.docIds = CASE WHEN $docId IN coalesce(e.docIds, []) THEN e.docIds
+                                             ELSE coalesce(e.docIds, []) + $docId END,
                              e.updated_at = timestamp()
                 """;
         try (Session session = driver.session()) {
             session.run(cypher, Map.of("name", entity.getName(), "type", entity.getType(),
-                    "desc", entity.getDescription()));
+                    "desc", entity.getDescription(), "source", source, "docId", docId));
         }
     }
 
     /**
      * 负责写入关系边
-     *
+     *(节点A: Entity {name: "Steve Jobs"})
+     *     │
+     *     │ ─── [关系: FOUNDED] ───▶
+     *     │       ├── confidence: 0.98
+     *     │       ├── sources: ["wiki_01.txt", "news_05.txt"]
+     *     │       ├── docIds: ["doc_101", "doc_105"]
+     *     │       └── updated_at: 1712395530123
+     *     ▼
+     * (节点B: Entity {name: "Apple Inc."})
      *
      * @param relation
      */
-    public void addRelation(ExtractionResult.Relation relation) {
+    public void addRelation(ExtractionResult.Relation relation, String source) {
         if (driver == null) return;
+        String docId = computeDocId(source);
         String relType = relation.getRelation().toUpperCase().replace(" ", "_");
         String cypher = String.format("""
                 MATCH (h:Entity {name: $head})
                 MATCH (t:Entity {name: $tail})
                 MERGE (h)-[r:%s]->(t)
-                SET r.confidence = $conf, r.updated_at = timestamp()
-                """, relType);
+                SET r.confidence = $conf,
+                    r.sources = CASE WHEN $source IN coalesce(r.sources, []) THEN r.sources
+                                     ELSE coalesce(r.sources, []) + $source END,
+                    r.docIds = CASE WHEN $docId IN coalesce(r.docIds, []) THEN r.docIds
+                                    ELSE coalesce(r.docIds, []) + $docId END,
+                    r.updated_at = timestamp()
+                """, relType);//用 Java 的 String.format 配合 %s 来硬拼接，因为数据库的查询优化器在执行前需要知道图的骨架结构
         try (Session session = driver.session()) {
             session.run(cypher, Map.of("head", relation.getHead(), "tail", relation.getTail(),
-                    "conf", relation.getConfidence()));
+                    "conf", relation.getConfidence(), "source", source, "docId", docId));
         }
     }
 
@@ -150,8 +171,50 @@ public class KnowledgeGraphService {
 
     public void deleteBySource(String source) {
         if (driver == null) return;
+        String docId = computeDocId(source);
         try (Session session = driver.session()) {
-            session.run("MATCH (e:Entity {source: $source}) DETACH DELETE e", Map.of("source", source));
+            //1.删除关系（边）上的来源标记
+            session.run("""
+                    MATCH ()-[r]-()
+                    WHERE $source IN coalesce(r.sources, []) OR $docId IN coalesce(r.docIds, [])
+                    SET r.sources = [s IN coalesce(r.sources, []) WHERE s <> $source],
+                        r.docIds = [d IN coalesce(r.docIds, []) WHERE d <> $docId]
+                    """, Map.of("source", source, "docId", docId));
+            //2.删除彻底失去来源支撑的关系（边）
+            session.run("""
+                    MATCH ()-[r]-()
+                    WHERE size(coalesce(r.sources, [])) = 0 OR size(coalesce(r.docIds, [])) = 0
+                    DELETE r
+                    """);
+            //3.删除实体（节点）上的来源标记
+            session.run("""
+                    MATCH (e:Entity)
+                    WHERE $source IN coalesce(e.sources, []) OR $docId IN coalesce(e.docIds, [])
+                    SET e.sources = [s IN coalesce(e.sources, []) WHERE s <> $source],
+                        e.docIds = [d IN coalesce(e.docIds, []) WHERE d <> $docId],
+                        e.updated_at = timestamp()
+                    """, Map.of("source", source, "docId", docId));
+            //4.删除彻底失去来源支撑的实体（节点）
+            session.run("""
+                    MATCH (e:Entity)
+                    WHERE size(coalesce(e.sources, [])) = 0 AND size(coalesce(e.docIds, [])) = 0
+                    DETACH DELETE e
+                    """);
+        }
+    }
+
+    /**
+     * 利用SHA-256 哈希算法计算出，截取前 16 个字符作为最终的 docId
+     * @param path
+     * @return
+     */
+    private static String computeDocId(String path) {
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(path.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(hash).substring(0, 16);
+        } catch (Exception e) {
+            return String.valueOf(path.hashCode());
         }
     }
 

@@ -64,13 +64,14 @@ public class KnowledgeController {
         //从 chunk 中抽取实体和关系,传入知识图谱
         List<ExtractionResult> extractions = extractor.extract(chunks);
         int entityCount = 0, relCount = 0;
+        String source = saved.getAbsolutePath();
         for (ExtractionResult ext : extractions) {
             for (ExtractionResult.Entity e : ext.getEntities()) {
-                knowledgeGraph.upsertEntity(e);
+                knowledgeGraph.upsertEntity(e, source);
                 entityCount++;
             }
             for (ExtractionResult.Relation r : ext.getRelations()) {
-                knowledgeGraph.addRelation(r);
+                knowledgeGraph.addRelation(r, source);
                 relCount++;
             }
         }
